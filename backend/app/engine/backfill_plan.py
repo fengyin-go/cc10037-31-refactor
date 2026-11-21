@@ -2,6 +2,10 @@
 
 回刷（Backfill）是针对历史分区的数据重建操作，
 需要将日期范围拆分为可并行执行的子任务批次。
+
+日分区序列的枚举收拢在 app.engine.partition_range 共享边界内；
+本引擎只声明回刷规划的端点约定：[开始分区, 结束分区]，
+并把边界明确的分区数据切分为调度读取的执行批次。
 """
 
 from __future__ import annotations
@@ -10,6 +14,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
 from typing import Any
+
+from app.engine.partition_range import (
+    DayPartitionReader,
+    InvalidPartitionDate,
+    enumerate_day_partitions,
+)
 
 
 class BackfillStatus(str, Enum):
@@ -75,6 +85,10 @@ class BackfillEngine:
             print(f"批次{batch.batch_id}: {batch.range.start}~{batch.range.end}")
     """
 
+    def __init__(self, partition_reader: DayPartitionReader | None = None) -> None:
+        # 区间依赖（如分区日历/元数据服务），默认无外部依赖
+        self._partition_reader = partition_reader
+
     def plan(
         self,
         pipeline_id: str,
@@ -94,11 +108,16 @@ class BackfillEngine:
             reason: 补偿原因
             partition_format: 分区格式字符串
         """
-        # 解析分区范围
+        # 区间生产收拢到共享边界：回刷约定 [开始分区, 结束分区] 双端皆含。
+        # 非法日期保持原降级响应（退化为单分区）；区间依赖读取失败向上抛，
+        # 重试成功前不得拿未枚举完整的结果派发批次。
         try:
-            start_dt = datetime.strptime(start_partition, partition_format)
-            end_dt = datetime.strptime(end_partition, partition_format)
-        except ValueError:
+            sequence = enumerate_day_partitions(
+                start_partition, end_partition, partition_format,
+                include_start=True, include_end=True,
+                reader=self._partition_reader,
+            )
+        except InvalidPartitionDate:
             # 退化为单分区
             pr = PartitionRange(
                 start=start_partition,
@@ -116,13 +135,7 @@ class BackfillEngine:
                 estimated_completion=datetime.now().isoformat(),
             )
 
-        # 枚举所有分区
-        all_partitions: list[str] = []
-        current = start_dt
-        while current <= end_dt:
-            all_partitions.append(current.strftime(partition_format))
-            current += timedelta(days=1)
-
+        all_partitions = sequence.as_list()
         if not all_partitions:
             all_partitions = [start_partition]
 

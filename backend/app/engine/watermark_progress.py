@@ -4,13 +4,23 @@
 - 水位推进（基于调度时间的分区递增）
 - 延迟检测（当前水位 vs 期望水位）
 - 滑动窗口内的迟到数据处理标记
+
+日分区序列的枚举收拢在 app.engine.partition_range 共享边界内；
+本引擎只声明进度检查的端点约定：(最近确认水位, 新水位]。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 from enum import Enum
+from typing import Any
+
+from app.engine.partition_range import (
+    DayPartitionReader,
+    InvalidPartitionDate,
+    enumerate_day_partitions,
+)
 
 
 class WatermarkStatus(str, Enum):
@@ -60,6 +70,10 @@ class WatermarkEngine:
 
         delay_report = eng.compute_delay_metrics([rec, ...])
     """
+
+    def __init__(self, partition_reader: DayPartitionReader | None = None) -> None:
+        # 区间依赖（如分区日历/元数据服务），默认无外部依赖
+        self._partition_reader = partition_reader
 
     def advance(
         self,
@@ -177,23 +191,24 @@ class WatermarkEngine:
 
     # ---- 内部 ----
 
-    @staticmethod
     def _enumerate_partitions(
-        start: str, end: str, fmt: str
+        self, start: str, end: str, fmt: str
     ) -> list[str]:
-        """枚举 start(不含) 到 end(含) 之间的所有分区值。"""
-        try:
-            start_dt = datetime.strptime(start, fmt)
-            end_dt = datetime.strptime(end, fmt)
-        except ValueError:
-            return [end]
+        """枚举 start(不含) 到 end(含) 之间的所有分区值。
 
-        partitions: list[str] = []
-        current = start_dt + timedelta(days=1)
-        while current <= end_dt:
-            partitions.append(current.strftime(fmt))
-            current += timedelta(days=1)
-        return partitions
+        进度检查的端点约定：(最近确认水位, 新水位] —— 从最近确认之后找缺口。
+        非法日期保持原响应退化为 [end]；区间依赖读取失败向上抛，
+        不消费未枚举完整的序列。
+        """
+        try:
+            sequence = enumerate_day_partitions(
+                start, end, fmt,
+                include_start=False, include_end=True,
+                reader=self._partition_reader,
+            )
+        except InvalidPartitionDate:
+            return [end]
+        return sequence.as_list()
 
     @staticmethod
     def _expected_watermark(scheduled_time: datetime, now: datetime) -> datetime:
